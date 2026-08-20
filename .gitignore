@@ -5,3 +5,4 @@ src/wisq/lib/synthetiq/data/output
 src/wisq/lib/synthetiq/data/input
 .DS_Store
 build
+results/benchmarking/raw_wisq/
