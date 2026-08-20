@@ -215,8 +215,9 @@ def write_payload(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def tee_process(command: list[str], *, log_path: Path) -> float:
+def tee_process(command: list[str], *, log_path: Path) -> tuple[str, float]:
     start = time.perf_counter()
+    lines: list[str] = []
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             command,
@@ -230,6 +231,7 @@ def tee_process(command: list[str], *, log_path: Path) -> float:
         for line in process.stdout:
             print(line, end="")
             log.write(line)
+            lines.append(line)
         returncode = process.wait()
     elapsed = time.perf_counter() - start
     if returncode != 0:
@@ -237,7 +239,18 @@ def tee_process(command: list[str], *, log_path: Path) -> float:
             f"WISQ failed with exit code {returncode}. See {log_path}\n"
             f"{' '.join(command)}"
         )
-    return elapsed
+    return "".join(lines), elapsed
+
+
+def parse_benchmark_wall_time(output: str) -> float:
+    match = re.search(
+        r"^Benchmark wall time:\s*([0-9.eE+-]+)\s*$",
+        output,
+        re.MULTILINE,
+    )
+    if not match:
+        raise RuntimeError("Could not parse WISQ internal benchmark wall time.")
+    return float(match.group(1))
 
 
 def architecture_argument(value: str) -> str:
@@ -284,6 +297,11 @@ def parse_wisq_output(path: Path, expected_routed_gates: int) -> tuple[dict, dic
 
     logical_steps = len(steps)
     logical_patch_slots = width * height
+    algorithm_qubit_slots = len(arch.get("alg_qubits", []))
+    magic_state_slots = len(arch.get("magic_states", []))
+    routing_patch_slots = logical_patch_slots - algorithm_qubit_slots - magic_state_slots
+    if routing_patch_slots < 0:
+        raise RuntimeError(f"{path.name}: architecture slot classes exceed its rectangle")
     volume = logical_patch_slots * logical_steps
     path_lengths = [
         len(gate_path.get("path", []))
@@ -294,8 +312,9 @@ def parse_wisq_output(path: Path, expected_routed_gates: int) -> tuple[dict, dic
         "architecture_width": width,
         "architecture_height": height,
         "architecture_logical_patch_slots": logical_patch_slots,
-        "algorithm_qubit_slots": len(arch.get("alg_qubits", [])),
-        "magic_state_slots": len(arch.get("magic_states", [])),
+        "algorithm_qubit_slots": algorithm_qubit_slots,
+        "magic_state_slots": magic_state_slots,
+        "routing_patch_slots": routing_patch_slots,
         "mapped_qubit_count": len(output["map"]),
         "routed_gate_count": routed_gate_count,
         "logical_steps": logical_steps,
@@ -345,7 +364,8 @@ def run_one(
     # Prevent a successful-looking subprocess that failed to rewrite its output
     # from being paired with a stale schedule from an earlier invocation.
     output_path.unlink(missing_ok=True)
-    wall_time_s = tee_process(command, log_path=log_path)
+    stdout, process_wall_time_s = tee_process(command, log_path=log_path)
+    wall_time_s = parse_benchmark_wall_time(stdout)
     metrics, wisq_metrics = parse_wisq_output(
         output_path, metadata["routed_gate_count"]
     )
@@ -353,12 +373,13 @@ def run_one(
         {
             "compilation_time_s": float(wall_time_s),
             "wall_time_s": float(wall_time_s),
-            "process_wall_time_s": float(wall_time_s),
+            "process_wall_time_s": float(process_wall_time_s),
         }
     )
     print(
         f"space={metrics['space']:.0f}, time={metrics['time']:.0f}, "
-        f"space-time={metrics['volume']:.0f}, wall={wall_time_s:.3f}s"
+        f"space-time={metrics['volume']:.0f}, fair-wall={wall_time_s:.3f}s, "
+        f"process-wall={process_wall_time_s:.3f}s"
     )
 
     return {
@@ -407,17 +428,34 @@ def new_payload(
                 "this WISQ version; each benchmark entry records one completed run."
             ),
             "metric_definition": {
-                "space": "architecture width * height in logical-patch grid slots",
-                "time": "number of WISQ routed schedule steps",
-                "volume": "space * time; derived for the shared comparison schema",
+                "space": (
+                    "Full rectangular architecture footprint, width * height logical-patch "
+                    "grid slots. The JSON also records algorithm-qubit, magic-state, and "
+                    "remaining routing-slot counts."
+                ),
+                "time": (
+                    "Number of WISQ routed schedule steps. Only CX, T, and Tdg enter the "
+                    "SCMR schedule; local Clifford gates such as H and S consume no steps."
+                ),
+                "volume": (
+                    "space * time, derived by this runner for the shared schema; WISQ does "
+                    "not natively report this volume. The footprint includes the full "
+                    "rectangle and boundary magic-state slots, but not distillation factories."
+                ),
             },
             "runtime_definition": {
-                "wall_time_s": "complete WISQ SCMR subprocess wall-clock time",
-                "compilation_time_s": (
-                    "same SCMR subprocess interval; WISQ does not emit a narrower "
-                    "internal compilation timer"
+                "wall_time_s": (
+                    "Fair internal WISQ SCMR wall time from QASM parsing through creation "
+                    "of the final routed schedule in memory; excludes CLI/import startup "
+                    "and final JSON serialization."
                 ),
-                "process_wall_time_s": "same complete SCMR subprocess interval",
+                "compilation_time_s": (
+                    "same internal SCMR compilation interval as wall_time_s"
+                ),
+                "process_wall_time_s": (
+                    "full WISQ subprocess interval, including Python/import startup and "
+                    "schedule JSON serialization"
+                ),
             },
         },
         "benchmarks": [],

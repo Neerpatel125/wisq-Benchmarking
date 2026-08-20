@@ -3,6 +3,7 @@ import ast
 import os
 import shutil
 import json
+import time
 from importlib.metadata import version
 from .guoq import CLIFFORDT, FAULT_TOLERANT_OPTIMIZATION_OBJECTIVE, GATE_SETS
 
@@ -167,6 +168,10 @@ def map_and_route(
         run_sat_scmr,
     )
 
+    # Fair cross-compiler timer: imports and CLI setup are complete.  Measure
+    # from QASM parsing until the routed schedule exists in memory, excluding
+    # final JSON serialization.
+    benchmark_wall_start = time.perf_counter()
     circ = QuantumCircuit.from_qasm_file(input_path)
     gates, ops = extract_gates_from_file(input_path)
     id_to_op = {i: ops[i] for i in range(len(ops))}
@@ -183,7 +188,9 @@ def map_and_route(
         map, steps, interrupted = run_dascot(circ, gates, arch, output_path, timeout)
     elif mode == "sat":
         map, steps = run_sat_scmr(circ, gates, arch, output_path, timeout)
+    benchmark_wall_time_s = time.perf_counter() - benchmark_wall_start
     dump(arch, map, steps, id_to_op, output_path, gates, interrupted=interrupted if mode == "dascot" else False)
+    console.print(f"Benchmark wall time: {benchmark_wall_time_s:.9f}")
 
 
 def optimize(
