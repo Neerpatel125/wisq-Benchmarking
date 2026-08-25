@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Benchmark WISQ/DASCOT on the TopoLS repository QASM circuits.
+"""Benchmark WISQ/DASCOT on the shared LS-Benchmarking QASM circuits.
 
 Run from the WISQ repository root after installing WISQ into its virtual
 environment:
 
-    .venv/bin/python run_wisq_repo_benchmarks.py --preset quick
+    .venv/bin/python run_wisq_repo_benchmarks.py
 
 By default, results are written directly to the sibling
 LS-Benchmarking-Results repository.  The runner uses WISQ's ``scmr`` mode
 because the TopoLS benchmark inputs are already expressed in Clifford+T.
 This measures WISQ's surface-code mapping and routing pass without adding a
 separate GUOQ circuit-optimization experiment.
+
+Circuits above 10,000 gates are skipped by default. Change the cutoff with
+``--max-gates``; use 0 to disable it.
 """
 
 from __future__ import annotations
@@ -28,7 +31,9 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_BENCHMARK_DIR = REPO_ROOT.parent / "TopoLS" / "docs" / "benchmark"
+DEFAULT_BENCHMARK_DIR = (
+    REPO_ROOT.parent / "LS-Benchmarking-Results" / "Benchmarks" / "QASM"
+)
 DEFAULT_RESULTS = (
     REPO_ROOT.parent
     / "LS-Benchmarking-Results"
@@ -40,24 +45,6 @@ RAW_DIR = REPO_ROOT / "results" / "benchmarking" / "raw_wisq"
 # executables commonly point at the base interpreter, while the ``wisq`` entry
 # point lives next to the symlink inside ``.venv/bin``.
 DEFAULT_WISQ = Path(sys.executable).with_name("wisq")
-
-CASES = {
-    "bv_16": {"display_name": "BV"},
-    "dj_16": {"display_name": "DJ"},
-    "grover_6": {"display_name": "Grover"},
-    "qft_16": {"display_name": "QFT"},
-    "qpe_16": {"display_name": "QPE"},
-    "vqe_16": {"display_name": "VQE"},
-    "ghz_16": {"display_name": "GHZ"},
-    "wstate_16": {"display_name": "W-state"},
-    "qaoa_16": {"display_name": "QAOA"},
-}
-
-PRESETS = {
-    "quick": ["bv_16", "dj_16", "ghz_16"],
-    "medium": ["bv_16", "dj_16", "ghz_16", "vqe_16", "qaoa_16", "wstate_16"],
-    "all": list(CASES),
-}
 
 METHOD_NAME = "wisq_scmr"
 MODE = "scmr"
@@ -82,22 +69,21 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--preset",
-        choices=PRESETS,
-        default="quick",
-        help="Benchmark set when --benchmarks is omitted (default: quick).",
-    )
-    parser.add_argument(
         "--benchmarks",
         nargs="+",
-        choices=list(CASES),
-        help="Explicit benchmark stems; overrides --preset.",
+        help="QASM stems to consider (default: every QASM in --benchmark-dir).",
     )
     parser.add_argument(
         "--benchmark-dir",
         type=Path,
         default=DEFAULT_BENCHMARK_DIR,
-        help="Directory containing the TopoLS benchmark QASM files.",
+        help="Directory containing the shared benchmark QASM files.",
+    )
+    parser.add_argument(
+        "--max-gates",
+        type=int,
+        default=10_000,
+        help="Skip circuits above this gate count (default: 10000; 0 disables).",
     )
     parser.add_argument(
         "--results-file",
@@ -208,6 +194,19 @@ def qasm_metadata(path: Path) -> dict:
         "routed_gate_count": sum(gate_counts.get(gate, 0) for gate in ROUTED_GATES),
         "unsupported_gate_counts": unsupported,
     }
+
+
+def benchmark_paths(benchmark_dir: Path, requested: list[str] | None) -> list[Path]:
+    if requested:
+        paths = [benchmark_dir / f"{stem}.qasm" for stem in requested]
+        missing = [path for path in paths if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(f"Missing benchmark: {missing[0]}")
+        return paths
+    paths = sorted(benchmark_dir.glob("*.qasm"))
+    if not paths:
+        raise RuntimeError(f"No QASM files found in {benchmark_dir}")
+    return paths
 
 
 def write_payload(path: Path, payload: dict) -> None:
@@ -359,7 +358,7 @@ def run_one(
         str(source_qasm),
     ]
 
-    print(f"\n--- {CASES[stem]['display_name']} | {label} ---")
+    print(f"\n--- {stem} | {label} ---")
     print(" ".join(command))
     # Prevent a successful-looking subprocess that failed to rewrite its output
     # from being paired with a stale schedule from an earlier invocation.
@@ -403,13 +402,14 @@ def new_payload(
         "schema_version": 2,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "description": (
-            "WISQ/DASCOT surface-code mapping and routing results on the TopoLS "
-            "repository benchmark circuits."
+            "WISQ/DASCOT surface-code mapping and routing results on the shared "
+            "LS-Benchmarking circuits."
         ),
         "selected_benchmarks": selected,
         "selected_methods": [METHOD_NAME],
         "benchmark_source_dir": str(benchmark_dir),
         "shared_wisq_config": {
+            "max_gates": args.max_gates,
             "mode": MODE,
             "architecture": args.architecture,
             "mr_solver": args.mr_solver,
@@ -483,6 +483,7 @@ def validate_resume_config(payload: dict, args: argparse.Namespace) -> None:
         "architecture": args.architecture,
         "mr_solver": args.mr_solver,
         "mr_timeout_s": args.mr_timeout,
+        "max_gates": args.max_gates,
     }
     actual = {key: config.get(key) for key in expected}
     if actual != expected:
@@ -498,10 +499,11 @@ def main() -> None:
     results_file = args.results_file.expanduser().resolve()
     args.wisq_executable = args.wisq_executable.expanduser().resolve()
     args.architecture = architecture_argument(args.architecture)
-    selected = args.benchmarks or PRESETS[args.preset]
 
     if args.mr_timeout < 1:
         raise ValueError("--mr-timeout must be at least 1 second")
+    if args.max_gates < 0:
+        raise ValueError("--max-gates must be >= 0")
     if not benchmark_dir.is_dir():
         raise FileNotFoundError(f"Benchmark directory not found: {benchmark_dir}")
     if not args.wisq_executable.is_file():
@@ -519,6 +521,41 @@ def main() -> None:
     ).is_file():
         raise FileNotFoundError(f"Custom WISQ architecture not found: {args.architecture}")
 
+    metadata: dict[str, dict] = {}
+    paths = benchmark_paths(benchmark_dir, args.benchmarks)
+    print("Source:    ", benchmark_dir)
+    print("Max gates: ", args.max_gates or "disabled")
+    print("\n" + "=" * 84)
+    print("INPUT CIRCUIT SUMMARY")
+    print("=" * 84)
+    for qasm in paths:
+        stem = qasm.stem
+        meta = qasm_metadata(qasm)
+        if args.max_gates and meta["gate_count"] > args.max_gates:
+            print(
+                f"SKIP {stem:<36} gates={meta['gate_count']:<7} "
+                f"(limit {args.max_gates})"
+            )
+            continue
+        if meta["unsupported_gate_counts"]:
+            raise RuntimeError(
+                f"{stem} has gates WISQ SCMR would silently ignore: "
+                f"{meta['unsupported_gate_counts']}"
+            )
+        metadata[stem] = meta
+        print(
+            f"RUN  {stem:<36} qubits={meta['num_qubits']:<3} "
+            f"gates={meta['gate_count']:<5} depth={meta['depth']:<5} "
+            f"routed={meta['routed_gate_count']:<5} T={meta['t_count']:<5} "
+            f"sha256={meta['qasm_sha256'][:12]}..."
+        )
+    print("=" * 84)
+
+    selected = list(metadata)
+    if not selected:
+        print("\nNo circuits are within the gate limit; nothing to run.")
+        return
+
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     if args.resume and results_file.exists():
         payload = json.loads(results_file.read_text(encoding="utf-8"))
@@ -527,38 +564,15 @@ def main() -> None:
     else:
         payload = new_payload(selected, benchmark_dir, args)
 
-    metadata: dict[str, dict] = {}
     print("\nBenchmarks:", ", ".join(selected))
     print("Method:    ", method_label(args.mr_solver, args.architecture))
-    print("Source:    ", benchmark_dir)
-    print("\n" + "=" * 84)
-    print("INPUT CIRCUIT SUMMARY")
-    print("=" * 84)
-    for stem in selected:
-        qasm = benchmark_dir / f"{stem}.qasm"
-        if not qasm.is_file():
-            raise FileNotFoundError(f"Missing benchmark: {qasm}")
-        meta = qasm_metadata(qasm)
-        if meta["unsupported_gate_counts"]:
-            raise RuntimeError(
-                f"{stem} has gates WISQ SCMR would silently ignore: "
-                f"{meta['unsupported_gate_counts']}"
-            )
-        metadata[stem] = meta
-        print(
-            f"{CASES[stem]['display_name']:<10} qubits={meta['num_qubits']:<3} "
-            f"gates={meta['gate_count']:<5} depth={meta['depth']:<5} "
-            f"routed={meta['routed_gate_count']:<5} T={meta['t_count']:<5} "
-            f"sha256={meta['qasm_sha256'][:12]}..."
-        )
-    print("=" * 84)
 
     for stem in selected:
         entry = find_entry(payload, stem)
         if entry is None:
             entry = {
                 "stem": stem,
-                "display_name": CASES[stem]["display_name"],
+                "display_name": stem,
                 **metadata[stem],
                 "runs": [],
             }
@@ -566,7 +580,7 @@ def main() -> None:
             write_payload(results_file, payload)
         if args.resume and completed(entry):
             print(
-                f"\nSkipping completed {CASES[stem]['display_name']} | "
+                f"\nSkipping completed {stem} | "
                 f"{method_label(args.mr_solver, args.architecture)}"
             )
             continue
