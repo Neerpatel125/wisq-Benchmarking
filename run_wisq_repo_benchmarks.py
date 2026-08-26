@@ -12,7 +12,7 @@ because the TopoLS benchmark inputs are already expressed in Clifford+T.
 This measures WISQ's surface-code mapping and routing pass without adding a
 separate GUOQ circuit-optimization experiment.
 
-Circuits above 10,000 gates are skipped by default. Change the cutoff with
+Circuits above 25,000 gates are skipped by default. Change the cutoff with
 ``--max-gates``; use 0 to disable it.
 
 Each benchmark has a two-hour hard wall-time limit by default. Timed-out runs
@@ -88,8 +88,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-gates",
         type=int,
-        default=10_000,
-        help="Skip circuits above this gate count (default: 10000; 0 disables).",
+        default=25_000,
+        help="Skip circuits above this gate count (default: 25000; 0 disables).",
     )
     parser.add_argument(
         "--results-file",
