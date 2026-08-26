@@ -14,6 +14,10 @@ separate GUOQ circuit-optimization experiment.
 
 Circuits above 10,000 gates are skipped by default. Change the cutoff with
 ``--max-gates``; use 0 to disable it.
+
+Each benchmark has a two-hour hard wall-time limit by default. Timed-out runs
+are recorded and the runner continues with the next benchmark. They are skipped
+by ``--resume`` and rerun only when starting a fresh run.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import argparse
 import hashlib
 import json
 import re
+import selectors
 import shutil
 import subprocess
 import sys
@@ -51,6 +56,7 @@ MODE = "scmr"
 DEFAULT_ARCHITECTURE = "square_sparse_layout"
 DEFAULT_MR_SOLVER = "dascot"
 DEFAULT_MR_TIMEOUT_S = 7200
+DEFAULT_TIMEOUT_S = 7200.0
 
 # WISQ/DASCOT routes CX, T, and Tdg.  The remaining Clifford gates below are
 # local operations in its SCMR model and therefore do not appear in the routed
@@ -112,6 +118,12 @@ def parse_args() -> argparse.Namespace:
         help="Per-circuit mapping/routing timeout in seconds (default: 7200).",
     )
     parser.add_argument(
+        "--timeout-s",
+        type=float,
+        default=DEFAULT_TIMEOUT_S,
+        help="Hard wall-time limit for each WISQ benchmark subprocess (default: 2 hours).",
+    )
+    parser.add_argument(
         "--mr-solver",
         choices=["dascot", "sat"],
         default=DEFAULT_MR_SOLVER,
@@ -120,7 +132,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Reuse completed WISQ entries already present in the result JSON.",
+        help="Skip completed or timed-out WISQ entries already present in the result JSON.",
     )
     return parser.parse_args()
 
@@ -214,7 +226,9 @@ def write_payload(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def tee_process(command: list[str], *, log_path: Path) -> tuple[str, float]:
+def tee_process(
+    command: list[str], *, log_path: Path, timeout_s: float
+) -> tuple[str, float]:
     start = time.perf_counter()
     lines: list[str] = []
     with log_path.open("w", encoding="utf-8") as log:
@@ -227,11 +241,33 @@ def tee_process(command: list[str], *, log_path: Path) -> tuple[str, float]:
             bufsize=1,
         )
         assert process.stdout is not None
-        for line in process.stdout:
-            print(line, end="")
-            log.write(line)
-            lines.append(line)
-        returncode = process.wait()
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        try:
+            while process.poll() is None:
+                if time.perf_counter() - start > timeout_s:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    raise TimeoutError(
+                        f"Timed out after {timeout_s:.0f}s: {' '.join(command)}; see {log_path}"
+                    )
+                for key, _ in selector.select(timeout=0.25):
+                    line = key.fileobj.readline()
+                    if line:
+                        print(line, end="")
+                        log.write(line)
+                        lines.append(line)
+            for line in process.stdout:
+                print(line, end="")
+                log.write(line)
+                lines.append(line)
+        finally:
+            selector.close()
+        returncode = int(process.returncode or 0)
     elapsed = time.perf_counter() - start
     if returncode != 0:
         raise RuntimeError(
@@ -274,7 +310,7 @@ def parse_wisq_output(path: Path, expected_routed_gates: int) -> tuple[dict, dic
     if missing:
         raise RuntimeError(f"{path.name}: WISQ output is missing keys: {missing}")
     if not output["fully_routed?"]:
-        raise RuntimeError(
+        raise TimeoutError(
             f"{path.name}: WISQ timed out and wrote a partial route; refusing to benchmark it."
         )
 
@@ -363,7 +399,11 @@ def run_one(
     # Prevent a successful-looking subprocess that failed to rewrite its output
     # from being paired with a stale schedule from an earlier invocation.
     output_path.unlink(missing_ok=True)
-    stdout, process_wall_time_s = tee_process(command, log_path=log_path)
+    stdout, process_wall_time_s = tee_process(
+        command, log_path=log_path, timeout_s=args.timeout_s
+    )
+    if re.search(r"\btimed out\b", stdout, re.IGNORECASE):
+        raise TimeoutError(f"{stem}: WISQ reported a mapping/routing timeout; see {log_path}")
     wall_time_s = parse_benchmark_wall_time(stdout)
     metrics, wisq_metrics = parse_wisq_output(
         output_path, metadata["routed_gate_count"]
@@ -414,6 +454,7 @@ def new_payload(
             "architecture": args.architecture,
             "mr_solver": args.mr_solver,
             "mr_timeout_s": args.mr_timeout,
+            "timeout_s_per_benchmark": args.timeout_s,
             "magic_state_assumption": (
                 "Built-in WISQ layouts surround the mapping region with dedicated "
                 "magic-state locations. Magic states are assumed readily available; "
@@ -471,9 +512,20 @@ def find_entry(payload: dict, stem: str) -> dict | None:
 
 def completed(entry: dict) -> bool:
     return any(
-        run.get("method") == METHOD_NAME and run.get("status", "ok") == "ok"
+        run.get("method") == METHOD_NAME
+        and run.get("status", "ok") in {"ok", "timeout"}
         for run in entry.get("runs", [])
     )
+
+
+def timeout_run(args: argparse.Namespace, error: Exception) -> dict:
+    return {
+        "method": METHOD_NAME,
+        "label": method_label(args.mr_solver, args.architecture),
+        "status": "timeout",
+        "timeout_s": args.timeout_s,
+        "error": str(error),
+    }
 
 
 def validate_resume_config(payload: dict, args: argparse.Namespace) -> None:
@@ -483,9 +535,14 @@ def validate_resume_config(payload: dict, args: argparse.Namespace) -> None:
         "architecture": args.architecture,
         "mr_solver": args.mr_solver,
         "mr_timeout_s": args.mr_timeout,
+        "timeout_s_per_benchmark": args.timeout_s,
         "max_gates": args.max_gates,
     }
     actual = {key: config.get(key) for key in expected}
+    # Results created before the hard subprocess limit was added used the same
+    # two-hour default through WISQ's internal mapping/routing timeout.
+    if actual["timeout_s_per_benchmark"] is None:
+        actual["timeout_s_per_benchmark"] = DEFAULT_TIMEOUT_S
     if actual != expected:
         raise RuntimeError(
             "Cannot --resume with different WISQ settings. "
@@ -504,6 +561,8 @@ def main() -> None:
         raise ValueError("--mr-timeout must be at least 1 second")
     if args.max_gates < 0:
         raise ValueError("--max-gates must be >= 0")
+    if args.timeout_s <= 0:
+        raise ValueError("--timeout-s must be positive")
     if not benchmark_dir.is_dir():
         raise FileNotFoundError(f"Benchmark directory not found: {benchmark_dir}")
     if not args.wisq_executable.is_file():
@@ -566,6 +625,7 @@ def main() -> None:
 
     print("\nBenchmarks:", ", ".join(selected))
     print("Method:    ", method_label(args.mr_solver, args.architecture))
+    print("Timeout:   ", f"{args.timeout_s:.0f}s per benchmark")
 
     for stem in selected:
         entry = find_entry(payload, stem)
@@ -580,12 +640,17 @@ def main() -> None:
             write_payload(results_file, payload)
         if args.resume and completed(entry):
             print(
-                f"\nSkipping completed {stem} | "
+                f"\nSkipping completed/timed-out {stem} | "
                 f"{method_label(args.mr_solver, args.architecture)}"
             )
             continue
 
-        run = run_one(stem, benchmark_dir / f"{stem}.qasm", metadata[stem], args)
+        try:
+            run = run_one(stem, benchmark_dir / f"{stem}.qasm", metadata[stem], args)
+        except TimeoutError as exc:
+            print(f"TIMEOUT: {exc}")
+            print("Continuing to the next benchmark.")
+            run = timeout_run(args, exc)
         entry["runs"] = [
             item
             for item in entry.get("runs", [])
