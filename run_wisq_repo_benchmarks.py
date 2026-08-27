@@ -15,9 +15,10 @@ separate GUOQ circuit-optimization experiment.
 Circuits above 25,000 gates are skipped by default. Change the cutoff with
 ``--max-gates``; use 0 to disable it.
 
-Each benchmark has a two-hour hard wall-time limit by default. Timed-out runs
-are recorded and the runner continues with the next benchmark. They are skipped
-by ``--resume`` and rerun only when starting a fresh run.
+Each benchmark has a two-hour hard wall-time limit by default. Timed-out and
+failed runs are recorded and the runner continues with the next benchmark.
+``--resume`` skips successful and timed-out runs but retries failures, so failed
+cases can be rerun after applying a hotfix.
 """
 
 from __future__ import annotations
@@ -132,7 +133,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Skip completed or timed-out WISQ entries already present in the result JSON.",
+        help="Skip successful or timed-out WISQ entries and retry failed ones already present in the result JSON.",
     )
     return parser.parse_args()
 
@@ -439,7 +440,7 @@ def new_payload(
     selected: list[str], benchmark_dir: Path, args: argparse.Namespace
 ) -> dict:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "description": (
             "WISQ/DASCOT surface-code mapping and routing results on the shared "
@@ -518,14 +519,28 @@ def completed(entry: dict) -> bool:
     )
 
 
-def timeout_run(args: argparse.Namespace, error: Exception) -> dict:
-    return {
+def unsuccessful_run(
+    stem: str,
+    args: argparse.Namespace,
+    status: str,
+    error: Exception,
+    *,
+    timeout_s: float | None = None,
+) -> dict:
+    run = {
         "method": METHOD_NAME,
         "label": method_label(args.mr_solver, args.architecture),
-        "status": "timeout",
-        "timeout_s": args.timeout_s,
+        "status": status,
+        "error_type": type(error).__name__,
         "error": str(error),
+        "artifacts": {
+            "schedule_json": str((RAW_DIR / f"{stem}__wisq_schedule.json").resolve()),
+            "log": str((RAW_DIR / f"{stem}__wisq.log").resolve()),
+        },
     }
+    if timeout_s is not None:
+        run["timeout_s"] = timeout_s
+    return run
 
 
 def validate_resume_config(payload: dict, args: argparse.Namespace) -> None:
@@ -640,7 +655,7 @@ def main() -> None:
             write_payload(results_file, payload)
         if args.resume and completed(entry):
             print(
-                f"\nSkipping completed/timed-out {stem} | "
+                f"\nSkipping successful/timed-out result {stem} | "
                 f"{method_label(args.mr_solver, args.architecture)}"
             )
             continue
@@ -650,7 +665,20 @@ def main() -> None:
         except TimeoutError as exc:
             print(f"TIMEOUT: {exc}")
             print("Continuing to the next benchmark.")
-            run = timeout_run(args, exc)
+            run = unsuccessful_run(
+                stem,
+                args,
+                "timeout",
+                exc,
+                timeout_s=args.timeout_s,
+            )
+        except Exception as exc:
+            print(
+                f"FAILED: {stem} | {method_label(args.mr_solver, args.architecture)}: {exc}",
+                file=sys.stderr,
+            )
+            print("Continuing to the next benchmark.")
+            run = unsuccessful_run(stem, args, "failed", exc)
         entry["runs"] = [
             item
             for item in entry.get("runs", [])
