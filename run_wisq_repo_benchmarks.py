@@ -17,8 +17,9 @@ Circuits above 25,000 gates are skipped by default. Change the cutoff with
 
 Each benchmark has a two-hour hard wall-time limit by default. Timed-out and
 failed runs are recorded and the runner continues with the next benchmark.
-``--resume`` skips successful and timed-out runs but retries failures, so failed
-cases can be rerun after applying a hotfix.
+``--resume`` skips successful and RuntimeError runs. It also skips timed-out
+runs unless ``--timeout-s`` changed, in which case those runs are retried.
+Changing ``--max-gates`` only changes circuit eligibility.
 """
 
 from __future__ import annotations
@@ -133,7 +134,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Skip successful or timed-out WISQ entries and retry failed ones already present in the result JSON.",
+        help=(
+            "Skip successful and RuntimeError WISQ entries. Timed-out entries are "
+            "skipped unless --timeout-s changed, in which case they are retried."
+        ),
     )
     return parser.parse_args()
 
@@ -511,11 +515,18 @@ def find_entry(payload: dict, stem: str) -> dict | None:
     )
 
 
-def completed(entry: dict) -> bool:
-    return any(
-        run.get("method") == METHOD_NAME
-        and run.get("status", "ok") in {"ok", "timeout"}
-        for run in entry.get("runs", [])
+def completed(entry: dict, *, timeout_s_changed: bool = False) -> bool:
+    runs = [
+        run for run in entry.get("runs", []) if run.get("method") == METHOD_NAME
+    ]
+    if any(run.get("status") == "ok" for run in runs):
+        return True
+    if any(run.get("error_type") == "RuntimeError" for run in runs):
+        return True
+    return not timeout_s_changed and any(
+        run.get("status") == "timeout"
+        or run.get("error_type") == "TimeoutError"
+        for run in runs
     )
 
 
@@ -543,26 +554,22 @@ def unsuccessful_run(
     return run
 
 
-def validate_resume_config(payload: dict, args: argparse.Namespace) -> None:
+def validate_resume_config(payload: dict, args: argparse.Namespace) -> bool:
     config = payload.get("shared_wisq_config", {})
     expected = {
         "mode": MODE,
         "architecture": args.architecture,
         "mr_solver": args.mr_solver,
         "mr_timeout_s": args.mr_timeout,
-        "timeout_s_per_benchmark": args.timeout_s,
-        "max_gates": args.max_gates,
     }
     actual = {key: config.get(key) for key in expected}
-    # Results created before the hard subprocess limit was added used the same
-    # two-hour default through WISQ's internal mapping/routing timeout.
-    if actual["timeout_s_per_benchmark"] is None:
-        actual["timeout_s_per_benchmark"] = DEFAULT_TIMEOUT_S
     if actual != expected:
         raise RuntimeError(
             "Cannot --resume with different WISQ settings. "
             f"Existing={actual}, requested={expected}"
         )
+    configured_timeout_s = config.get("timeout_s_per_benchmark")
+    return configured_timeout_s != args.timeout_s
 
 
 def main() -> None:
@@ -631,10 +638,23 @@ def main() -> None:
         return
 
     RAW_DIR.mkdir(parents=True, exist_ok=True)
+    timeout_s_changed = False
     if args.resume and results_file.exists():
         payload = json.loads(results_file.read_text(encoding="utf-8"))
-        validate_resume_config(payload, args)
+        config = payload.setdefault("shared_wisq_config", {})
+        configured_timeout_s = config.get("timeout_s_per_benchmark")
+        timeout_s_changed = validate_resume_config(payload, args)
+        payload["selected_benchmarks"] = list(
+            dict.fromkeys(payload.get("selected_benchmarks", []) + selected)
+        )
+        write_payload(results_file, payload)
         print(f"Resuming from {results_file}")
+        if timeout_s_changed:
+            print(
+                "Timeout changed: "
+                f"{configured_timeout_s:g}s -> {args.timeout_s:g}s; "
+                "timed-out results will be retried."
+            )
     else:
         payload = new_payload(selected, benchmark_dir, args)
 
@@ -653,9 +673,11 @@ def main() -> None:
             }
             payload["benchmarks"].append(entry)
             write_payload(results_file, payload)
-        if args.resume and completed(entry):
+        if args.resume and completed(
+            entry, timeout_s_changed=timeout_s_changed
+        ):
             print(
-                f"\nSkipping successful/timed-out result {stem} | "
+                f"\nSkipping successful/unchanged-timeout/RuntimeError result {stem} | "
                 f"{method_label(args.mr_solver, args.architecture)}"
             )
             continue
@@ -687,6 +709,12 @@ def main() -> None:
         entry["runs"].append(run)
         write_payload(results_file, payload)
 
+    # Commit the new timeout only after the pass completes. If this process is
+    # interrupted, the next resume still retries timeouts it did not reach.
+    config = payload.setdefault("shared_wisq_config", {})
+    config["max_gates"] = args.max_gates
+    config["timeout_s_per_benchmark"] = args.timeout_s
+    write_payload(results_file, payload)
     print(f"\nSaved JSON results to: {results_file}")
     print(f"Raw WISQ schedules/logs: {RAW_DIR}")
 
